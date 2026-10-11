@@ -10,7 +10,7 @@
 
 1. 重启辅助工具以加载修改，保持 MuMu 官服请求经过代理。源码启动示例：`python src/main.py --open-ui`（需先安装项目依赖）。
 2. 在管理界面开启扫码记录，进入 MuMu 官服的扫码登录界面，用应用宝渠道服游戏完成一次正常扫码登录。若已有有效的阴阳师扫码记录，可直接使用。
-3. 在管理界面选择**阴阳师**，将刚保存的**扫码记录**设为默认／自动登录账号。不要选择“QQ 手动登录”导入方式。可按需设置自动登录延迟。
+3. 正常扫码成功并保存后，该扫码记录会自动成为阴阳师（`g37`）的默认账号；无需再手动设默认。不要选择“QQ 手动登录”导入方式。可按需设置自动登录延迟。
 4. 下次官服展示新二维码时，工具使用该记录自动发起扫码和确认；不复用旧二维码或旧的一次性登录码。
 5. 不再需要时，在管理界面清除阴阳师的默认账号设置。
 
@@ -38,21 +38,18 @@ python -m unittest discover -s tests -p test_saved_scan_login.py -v
 源代码现在支持把常规 mitmproxy 绑定到指定网卡，默认仍然只监听 `127.0.0.1`。为了让桥接网络中的 MuMu 访问本机代理，启动时显式指定模式和监听地址，例如：
 
 ```powershell
-python src/main.py --proxy-mode process --proxy-listen-host 192.168.1.21 --proxy-port 10717
+python src/main.py --proxy-mode process --proxy-listen-host <HOST_LAN_IPV4> --proxy-port 10717
 ```
 
-其中 `192.168.1.21` 应替换为运行工具的 Windows 主机局域网地址。不要在没有必要时使用 `0.0.0.0`，并确保 Windows 防火墙只允许 MuMu 所在网段访问 `10717`。
+其中主机地址应替换为运行工具的 Windows 主机、且模拟器可以访问的局域网 IPv4；设备序列号可通过 `adb devices` 查询。不要在没有必要时使用 `0.0.0.0`，并确保 Windows 防火墙只允许 MuMu 所在网段访问 `10717`。
 
 然后将 MuMu 的全局 HTTP 代理指向主机地址：
 
 ```powershell
-& 'D:\Program Files\Netease\MuMu\nx_device\12.0\shell\adb.exe' `
-  -s 192.168.1.122:5555 `
-  shell settings put global http_proxy 192.168.1.21:10717
+adb devices
 
-& 'D:\Program Files\Netease\MuMu\nx_device\12.0\shell\adb.exe' `
-  -s 192.168.1.122:5555 `
-  shell settings get global http_proxy
+adb -s '<你的设备序列号>' shell settings put global http_proxy '<电脑局域网IPv4>:10717'
+adb -s '<你的设备序列号>' shell settings get global http_proxy
 ```
 
 证书安装仍需在 MuMu 中完成，并且每次重新启动工具后先确认 `10717` 正在监听，再让游戏发起请求。此模式不会替代扫码，也不会生成永久登录凭证；扫码失效时仍需重新扫码。

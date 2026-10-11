@@ -1,6 +1,6 @@
 @echo off
 setlocal
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0start-idv-login-only.ps1" %*
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0start-idv-login-only.ps1" -OpenUI %*
 set "EC=%ERRORLEVEL%"
 if not "%EC%"=="0" (
   echo.
