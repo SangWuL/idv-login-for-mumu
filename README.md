@@ -1,4 +1,4 @@
-# IdentityV-login-helper
+# IdentityV-login-for-mumu
 ![Language](https://img.shields.io/badge/language-python-blue.svg)
 ![GitHub License](https://img.shields.io/github/license/KKeygen/idv-login)
 ![GitHub Release](https://img.shields.io/github/v/release/KKeygen/idv-login)
@@ -47,7 +47,7 @@ py -3.12 -m venv .venv
 
    上例地址仅为格式示例，请替换为你自己的地址和设备序列号。只运行辅助工具、不让脚本改模拟器代理时，使用 `start-idv-login-only.cmd`；该模式下需要你自行确保模拟器已指向正确的代理。
 4. 首次运行时，工具会生成并导入本机代理 CA 证书。
-5. 在工具管理页面开启扫码记录，然后在模拟器内进入**官方渠道服**登录界面，用你自己的渠道服账号正常扫描游戏显示的新二维码并完成登录。成功后，工具会保存可用的渠道记录并将其设为该游戏默认自动登录账号；以后会尝试对新二维码自动确认。
+5. 在模拟器内进入**官方服**扫码登录界面，用你自己的渠道服账号正常扫描游戏显示的二维码并完成登录。成功后，工具会保存可用的渠道记录并将其设为该游戏默认自动登录账号，记录可在管理页面查看；以后会尝试对新二维码自动确认。
 6. 下次启动时保持工具运行，再打开游戏。
 
 ### 脚本选项与代理恢复
