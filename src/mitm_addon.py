@@ -130,6 +130,9 @@ class IDVLoginAddon:
         self._hosted_targets_by_process = {}
         self._held_hosted_query_flows = {}
         self._pending_tool_auth = set()
+        # Selection is currently global: only the newest QR may auto-confirm.
+        self._auto_scan_ticket = None
+        self._auto_scan_generation = None
 
         self.auth_status_domain = str(
             genv.get("DOMAIN_TARGET_AUTH_STATUS", "") or ""
@@ -633,7 +636,12 @@ class IDVLoginAddon:
             game_id = query.get("game_id", "")
             process_id = query.get("process_id", "")
 
-            self.genv.set("CHANNEL_ACCOUNT_SELECTED", "")
+            ticket = (game_id, process_id, data["uuid"])
+            new_ticket = ticket != self._auto_scan_ticket
+            if new_ticket:
+                self._auto_scan_ticket = ticket
+                self._auto_scan_generation = object()
+                self.genv.set("CHANNEL_ACCOUNT_SELECTED", "")
 
             qr_data = {
                 "uuid": data["uuid"],
@@ -658,32 +666,8 @@ class IDVLoginAddon:
                 self.stack_mgr.push_cached_qrcode_data(effective_game_id, process_id, qr_data)
                 self.stack_mgr.ensure_pending_stack(effective_game_id)
 
-            # Auto-login
-            auto_uuid = self.genv.get(f"auto-{effective_game_id}", "")
-            if auto_uuid:
-                delay = self.game_helper.get_login_delay(effective_game_id)
-                self.logger.info(f"即将自动登录，{delay}秒后开始扫码")
-                self.genv.set("CHANNEL_ACCOUNT_SELECTED", auto_uuid)
-
-                def _delayed_scan():
-                    time.sleep(delay)
-                    # simulate_scan 可能触发 webLogin 创建 Qt 对象，
-                    # 必须在 Qt 主线程中执行
-                    def _do_scan():
-                        def _on_scan_complete(result):
-                            # result 可能是空字典 {} (返回200但内容为空)，这也算成功
-                            if result is not None and result is not False:
-                                self.logger.info("自动登录成功")
-                            else:
-                                self.logger.warning("自动登录失败，可能需要重新授权")
-                        app_state.channels_helper.simulate_scan(
-                            auto_uuid, qr_data["uuid"], qr_data["game_id"],
-                            on_complete=_on_scan_complete
-                        )
-                    app_state.run_on_main_thread(_do_scan)
-
-                t = threading.Thread(target=_delayed_scan, daemon=True)
-                t.start()
+            if new_ticket:
+                self._schedule_auto_scan(qr_data, effective_game_id)
 
             # Change the QR code redirect URL
             is_compat = getattr(getattr(app_state, "proxy_mgr", None), "mode", "") == "compat"
@@ -696,7 +680,9 @@ class IDVLoginAddon:
                 qr_url = (
                     f"idvlogin://open?game_id={effective_game_id}&view=accounts"
                 )
-            data["qrcode_scanners"][0]["url"] = qr_url
+            scanners = data.get("qrcode_scanners")
+            if isinstance(scanners, list) and scanners and isinstance(scanners[0], dict):
+                scanners[0]["url"] = qr_url
 
             if self.genv.get("SCAN_RECORD_ENABLED", True):
                 data["scanner_guide_text"] = "已开启扫码登录【官服/渠道服】账号，如需长期保存，点击上方图标"
@@ -705,6 +691,60 @@ class IDVLoginAddon:
             flow.response.content = json.dumps(data).encode()
         except Exception:
             self.logger.exception("处理 create_login 响应失败")
+
+    def _schedule_auto_scan(self, qr_data, effective_game_id):
+        """Reuse an explicitly selected account, never choose one by channel name."""
+        auto_uuid = self.genv.get(f"auto-{effective_game_id}", "")
+        manager = app_state.channels_helper
+        record = manager.query_channel(auto_uuid) if manager and auto_uuid else None
+        if record is None:
+            return
+        generation = self._auto_scan_generation
+
+        def is_current():
+            return (self._auto_scan_generation is generation
+                    and self.genv.get(f"auto-{effective_game_id}", "") == auto_uuid
+                    and self.genv.get("CHANNEL_ACCOUNT_SELECTED", "") in ("", auto_uuid)
+                    and manager.query_channel(auto_uuid) is record)
+
+        # Preflight scan records without starting a manual/QQ login dialog.
+        if record.record_source == "scan":
+            try:
+                record.request_unisdk(effective_game_id, interactive=False)
+            except Exception:
+                self.logger.warning("默认扫码记录已过期或不适用于当前游戏，请用渠道服重新扫码")
+                return
+        delay = self.game_helper.get_login_delay(effective_game_id)
+        self.logger.info(f"即将自动登录，{delay}秒后使用已保存记录确认二维码")
+
+        def on_complete(result):
+            if not is_current():
+                return
+            if result is not None and result is not False:
+                self.logger.info("二维码已确认，等待游戏完成登录")
+            else:
+                self.genv.set("CHANNEL_ACCOUNT_SELECTED", "")
+                self.logger.warning("自动确认失败，请用渠道服重新扫码授权")
+
+        def do_scan():
+            if not is_current():
+                return
+            self.genv.set("CHANNEL_ACCOUNT_SELECTED", auto_uuid)
+            manager.simulate_scan(auto_uuid, qr_data["uuid"], qr_data["game_id"],
+                                  on_complete=on_complete, is_current=is_current)
+
+        def delayed_scan():
+            time.sleep(delay)
+            if not is_current():
+                return
+            if record.record_source == "scan":
+                # Saved scan credentials only need HTTP; do not block Qt's event loop.
+                do_scan()
+            else:
+                # Existing manual adapters may create Qt objects.
+                app_state.run_on_main_thread(do_scan)
+
+        threading.Thread(target=delayed_scan, daemon=True).start()
 
     def _effective_hosted_game_id(self, flow: http.HTTPFlow) -> str:
         query = flow.request.query
@@ -735,6 +775,8 @@ class IDVLoginAddon:
 
             qr_status = data.get("qrcode", {}).get("status", 0)
             if qr_status == 2 and not self.genv.get("CHANNEL_ACCOUNT_SELECTED"):
+                # A real channel scan won the race against the delayed auto-login.
+                self._auto_scan_generation = object()
                 self.stack_mgr.push_pending_login_info(
                     game_id, process_id, data["login_info"]
                 )

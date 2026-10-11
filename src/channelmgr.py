@@ -30,6 +30,18 @@ from channel_cache import packet_identity, credential_expires_at, exception_summ
 from ssl_utils import should_verify_ssl
 
 
+QR_REQUEST_TIMEOUT = (5, 20)
+
+
+def _qrcode_result(response):
+    """HTTP 200 alone is not confirmation; never include server payloads in errors."""
+    response.raise_for_status()
+    result = response.json()
+    if not isinstance(result, dict) or result.get("code", -1) not in (-1, 0):
+        raise ValueError("二维码请求被服务器拒绝，请重新扫码")
+    return result
+
+
 def legacy_record_source(data: dict) -> str:
     """按旧版实际落盘字段区分手动账号与扫码记录，不按渠道名猜测。"""
     if not isinstance(data, dict):
@@ -90,8 +102,11 @@ class channel:
         self.create_time = create_time
         self.last_login_time = last_login_time
         self.uuid = f"{login_info['login_channel']}-{login_info['code']}" if uuid == "" else uuid
-        self.channel_name = (ext_info.get("src_app_channel2") or login_info["login_channel"]) if self.record_source == "scan" else login_info["login_channel"]
-        self.game_id = ext_info.get("from_game_id", "")
+        scan_ext = user_info.get("pc_ext_info") or ext_info
+        if not isinstance(scan_ext, dict):
+            scan_ext = ext_info
+        self.channel_name = (scan_ext.get("src_app_channel2") or login_info["login_channel"]) if self.record_source == "scan" else login_info["login_channel"]
+        self.game_id = scan_ext.get("from_game_id") or scan_ext.get("src_jf_game_id", "")
         self.crossGames = type(self) is not channel
         self.unisdk_cache = {}
         self.expires_at = None
@@ -231,7 +246,8 @@ class channel:
         """Keep operation context and traceback locations, without payloads or locals."""
         logger = setup_logger()
         logger.debug('[channel] account={} game={} channel={} stage={} result={} {}',
-                     self.uuid, getShortGameId(game_id), self.channel_name, stage, message, detail)
+                     "scan-record" if self.record_source == "scan" else self.uuid,
+                     getShortGameId(game_id), self.channel_name, stage, message, detail)
         if error is not None:
             logger.debug('{}', exception_summary(error))
         if on_error is not None:
@@ -362,19 +378,28 @@ class channel:
         return ready(result)
 
     def get_uniSdk_data(self, game_id: str = "", on_complete=None, *, interactive=True):
-        if "id" not in self.user_info or "token" not in self.user_info:
+        if not self.user_info.get("id") or not self.user_info.get("token"):
             raise ValueError("渠道登录信息不完整：缺少 user_id 或 token，请重新登录")
+        game_id = game_id or self.game_id
+        if self.is_login_expired(game_id):
+            raise ValueError("扫码登录凭据已过期，请用渠道服重新扫码")
+        ext = self.user_info.get("pc_ext_info") or self.ext_info
+        if not isinstance(ext, dict):
+            raise ValueError("field=pc_ext_info: expected object")
+        extra = ext.get("extra_unisdk_data", "")
+        if isinstance(extra, dict):
+            extra = json.dumps(extra, ensure_ascii=False)
         result = {
             "user_id": self.user_info["id"],
             "token": self.user_info["token"],
-            "login_channel": self.ext_info.get("src_app_channel2") or self.channel_name,
-            "udid": self.ext_info.get("src_udid", ""),
-            "app_channel": self.ext_info.get("src_app_channel", ""),
-            "sdk_version": self.ext_info.get("src_jf_game_id", ""),
-            "jf_game_id": self.ext_info.get("src_jf_game_id", ""),
-            "pay_channel": self.ext_info.get("src_pay_channel", ""),
+            "login_channel": ext.get("src_app_channel2") or self.channel_name,
+            "udid": ext.get("src_udid", ""),
+            "app_channel": ext.get("src_app_channel", ""),
+            "sdk_version": ext.get("src_sdk_version", ""),
+            "jf_game_id": ext.get("src_jf_game_id", ""),
+            "pay_channel": ext.get("src_pay_channel", ""),
             "extra_data": "",
-            "extra_unisdk_data": self.ext_info.get("extra_unisdk_data", ""),
+            "extra_unisdk_data": extra,
             "gv": "157",
             "gvn": "1.5.80",
             "cv": "a1.5.0",
@@ -579,7 +604,7 @@ class ChannelManager:
         tmp_channel.crossGames = False
         tmp_channel.last_login_time = time.time()
         import app_state
-        login_channel = tmp_channel.ext_info.get("src_app_channel2") or login_info["login_channel"]
+        login_channel = tmp_channel.channel_name
 
         if login_channel in native_scan_channels(tmp_channel.game_id):
             app_state.toast("扫码登录由游戏原生保存，可在游戏账号列表中继续使用。", duration=5000)
@@ -587,10 +612,8 @@ class ChannelManager:
 
         manual_name = self._manual_channel_name(login_channel, game_id)
         if manual_name:
-            self.logger.info(f"正在扫码导入{manual_name}账号，保存时间较短，请前往渠道服管理界面手动登录以长期保存。")
-            toast_text = f"您正在扫码导入{manual_name}账号，保存时间较短，请及时参看教程，前往【渠道服管理界面】操作"
-        else:
-            toast_text = "扫码结果已临时保存，时长约3天，可在游戏的下拉框中选择账号登录。"
+            self.logger.info(f"正在扫码导入{manual_name}账号")
+        toast_text = "扫码记录已保存，可在渠道服管理界面设为默认账号自动确认登录；凭据过期后需重新扫码。"
 
         previous = self.channels[:]
         saved = False
@@ -615,6 +638,11 @@ class ChannelManager:
             self.channels.append(tmp_channel)
             self.save_records()
             saved = True
+            # A successful ordinary channel QR login becomes the default
+            # account for this game. The proxy uses this persisted mapping
+            # to confirm the next game QR automatically. Native channel QR
+            # flows return above and remain controlled by the game itself.
+            genv.set(f"auto-{tmp_channel.game_id}", tmp_channel.uuid, True)
             from account_list_policy import AccountListPolicy
             AccountListPolicy(self).include_logged_in(tmp_channel)
         except Exception as error:
@@ -1063,8 +1091,10 @@ class ChannelManager:
             message = '获取登录数据失败，请重试；仍失败时反馈日志'
         record.report_login_failure(game_id, stage, message, error, notify=True, on_error=on_error)
 
-    def simulate_confirm(self, channel: channel, scanner_uuid: str, game_id: str, on_complete=None, on_error=None):
+    def simulate_confirm(self, channel: channel, scanner_uuid: str, game_id: str, on_complete=None, on_error=None, *, is_current=None):
         def _do_confirm(channel_data):
+            if is_current is not None and not is_current():
+                return None
             result = False
             try:
                 if isinstance(channel_data, Exception):
@@ -1075,18 +1105,21 @@ class ChannelManager:
                     self._credential_failure(channel, game_id, 'switch.credentials', None, on_error)
                 else:
                     body_data = dict(channel_data, uuid=scanner_uuid, game_id=game_id)
-                    body = "&".join([f"{k}={v}" for k, v in body_data.items()])
                     response = requests.post(
-                        "https://service.mkey.163.com/mpay/api/qrcode/confirm_login", data=body,
+                        "https://service.mkey.163.com/mpay/api/qrcode/confirm_login", data=body_data,
                         headers={"Content-Type": "application/x-www-form-urlencoded"},
-                        verify=should_verify_ssl())
-                    response.raise_for_status()
-                    result = response.json()
+                        verify=should_verify_ssl(), timeout=QR_REQUEST_TIMEOUT)
+                    result = _qrcode_result(response)
             except Exception as error:
+                if is_current is not None and not is_current():
+                    return None
                 channel.report_login_failure(game_id, 'switch.confirm',
                     '游戏确认登录失败，请重新扫码；仍失败时反馈日志', error, notify=True, on_error=on_error)
+            if is_current is not None and not is_current():
+                return None
             if result is None or result is False:
-                genv.set("CHANNEL_ACCOUNT_SELECTED", "")
+                if genv.get("CHANNEL_ACCOUNT_SELECTED", "") == channel.uuid:
+                    genv.set("CHANNEL_ACCOUNT_SELECTED", "")
             if on_complete:
                 on_complete(result)
             return result
@@ -1101,7 +1134,9 @@ class ChannelManager:
             channel_data = error
         return _do_confirm(channel_data)
 
-    def simulate_scan(self, uuid: str | channel, scanner_uuid: str, game_id: str, on_complete=None, on_error=None):
+    def simulate_scan(self, uuid: str | channel, scanner_uuid: str, game_id: str, on_complete=None, on_error=None, *, is_current=None):
+        if is_current is not None and not is_current():
+            return None
         # A hosted MPay callback can supply credentials without a tool record.
         records = self.channels if isinstance(uuid, str) else (uuid,)
         for channel in records:
@@ -1153,30 +1188,42 @@ class ChannelManager:
                         except Exception as error:
                             result = error
                         return _ready(result)
+                    # Validate a saved scan before marking a fresh QR as scanned.
+                    # This never invokes a QQ/manual-login adapter.
+                    if channel.record_source == "scan":
+                        channel.request_unisdk(game_id, interactive=False)
+                    if is_current is not None and not is_current():
+                        return None
                     r = requests.get(
                         "https://service.mkey.163.com/mpay/api/qrcode/scan",
                         params=data,
-                        verify=should_verify_ssl()
+                        verify=should_verify_ssl(), timeout=QR_REQUEST_TIMEOUT
                     )
                     
                     r.raise_for_status()
                     resp=r.json()
                     if resp.get("code",-1)==1424:
+                        if is_current is not None and not is_current():
+                            return None
                         data["game_id"]=resp["game"]["id"]
+                        if channel.record_source == "scan":
+                            channel.request_unisdk(data["game_id"], interactive=False)
                         self.logger.info(f"发烧平台游戏id:{data['game_id']}")
                         r=requests.get(
                             "https://service.mkey.163.com/mpay/api/qrcode/scan",
                             params=data,
-                            verify=should_verify_ssl()
+                            verify=should_verify_ssl(), timeout=QR_REQUEST_TIMEOUT
                         )
-                    if r.status_code == 200:
-                        return self.simulate_confirm(channel, scanner_uuid, data["game_id"], on_complete=on_complete, on_error=on_error)
-                    else:
-                        r.raise_for_status()
+                    _qrcode_result(r)
+                    return self.simulate_confirm(channel, scanner_uuid, data["game_id"],
+                        on_complete=on_complete, on_error=on_error, is_current=is_current)
                 except Exception as error:
+                    if is_current is not None and not is_current():
+                        return None
                     channel.report_login_failure(game_id, 'switch.scan',
                         '游戏扫码请求失败，请重新扫码；仍失败时反馈日志', error, notify=True, on_error=on_error)
-                    genv.set("CHANNEL_ACCOUNT_SELECTED", "")
+                    if genv.get("CHANNEL_ACCOUNT_SELECTED", "") == channel.uuid:
+                        genv.set("CHANNEL_ACCOUNT_SELECTED", "")
                     if on_complete:
                         on_complete(False)
                     return False

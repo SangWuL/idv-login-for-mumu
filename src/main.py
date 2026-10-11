@@ -30,6 +30,8 @@ def parse_command_line_args():
     arg_parser.add_argument('--uri', type=str, default="", help='处理 idvlogin:// URI Scheme 调用')
     arg_parser.add_argument('--open-ui', action='store_true', help='启动后直接打开渠道服管理界面')
     arg_parser.add_argument('--proxy-port', type=int, default=10717, help='mitmproxy 监听端口 (默认 10717)')
+    arg_parser.add_argument('--proxy-listen-host', type=str, default='127.0.0.1', help='regular proxy listen host (default: 127.0.0.1; use 0.0.0.0 for MuMu/LAN clients)')
+    arg_parser.add_argument('--proxy-mode', choices=('compat', 'global', 'process'), default='', help='temporary proxy mode override (not persisted)')
     arg_parser.add_argument('--debug', action='store_true', help='开发调试：使用 mitmweb 打开 Web 代理界面 (默认 http://127.0.0.1:8081/)')
     return arg_parser.parse_args()
 
@@ -1061,7 +1063,7 @@ def setup_shortcuts():
     shortcutMgr_instance = ShortcutMgr()
     shortcutMgr_instance.handle_shortcuts()
 
-def setup_network_proxy(proxy_port):
+def setup_network_proxy(proxy_port, proxy_mode=None, proxy_listen_host=None):
     """Set up the mitmproxy-based network proxy.
 
     Supports three modes:
@@ -1146,8 +1148,9 @@ def setup_network_proxy(proxy_port):
     uri_game_id = genv.get("URI_STARTUP_GAME_ID", "")
     uri_installation_id = genv.get("URI_STARTUP_INSTALLATION_ID", "")
     uri_initial_view = genv.get("URI_STARTUP_VIEW", "")
+    uri_open_ui = bool(genv.get("URI_STARTUP_OPEN_UI"))
     auto_games = game_helper.list_auto_start_games()
-    proxy_mode = genv.get("proxy_mode", "")
+    proxy_mode = proxy_mode or genv.get("proxy_mode", "")
     if not proxy_mode:
         proxy_mode = "compat"
         genv.set("proxy_mode", "compat", True)
@@ -1182,14 +1185,14 @@ def setup_network_proxy(proxy_port):
             # 回退到常规模式（不持久化，下次启动仍尝试兼容模式）
             proxy_mode = "process" if auto_games else "global"
             from mitm_proxy import MitmProxyManager
-            proxy_mgr = MitmProxyManager(addon=addon, port=proxy_port, mode="regular", debug=bool(CLI_ARGS.debug))
+            proxy_mgr = MitmProxyManager(addon=addon, port=proxy_port, mode="regular", debug=bool(CLI_ARGS.debug), listen_host=proxy_listen_host or "127.0.0.1")
             proxy_mgr.start()
             m_proxy = proxy_mgr
             app_state.proxy_mgr = proxy_mgr
     else:
         # 常规代理模式（global 或 process）
         from mitm_proxy import MitmProxyManager
-        proxy_mgr = MitmProxyManager(addon=addon, port=proxy_port, mode="regular", debug=bool(CLI_ARGS.debug))
+        proxy_mgr = MitmProxyManager(addon=addon, port=proxy_port, mode="regular", debug=bool(CLI_ARGS.debug), listen_host=proxy_listen_host or "127.0.0.1")
         proxy_mgr.start()
         m_proxy = proxy_mgr
         app_state.proxy_mgr = proxy_mgr
@@ -1248,14 +1251,18 @@ def setup_network_proxy(proxy_port):
     start_uri_listener(_on_uri_signal)
 
     # If we were launched via --uri / --open-ui, open the UI
-    if genv.get("URI_STARTUP_OPEN_UI"):
+    if uri_open_ui:
         startup_game_id = genv.get("URI_STARTUP_GAME_ID", "")
         ui_mgr.open_for_game(startup_game_id, uri_initial_view)
         genv.set("URI_STARTUP_OPEN_UI", "")
         genv.set("URI_STARTUP_VIEW", "")
 
     from run_once import run_once_after_qt
-    run_once_after_qt(ui_mgr)
+    # A URI launch already queued the requested page above.  The one-time
+    # account-switching wizard must not enqueue a second page load, otherwise
+    # it can replace the URI target while its application settings are loading.
+    if not uri_open_ui and not uri_action:
+        run_once_after_qt(ui_mgr)
 
     # 根据模式执行不同的启动逻辑
     if proxy_mode == "compat":
@@ -1676,7 +1683,9 @@ def main(cli_args=None):
 
         # 网络代理设置 (mitmproxy normal mode)
         proxy_port = cli_args.proxy_port
-        setup_network_proxy(proxy_port)
+        proxy_mode_override = getattr(cli_args, "proxy_mode", "") or None
+        proxy_listen_host = getattr(cli_args, "proxy_listen_host", "127.0.0.1")
+        setup_network_proxy(proxy_port, proxy_mode=proxy_mode_override, proxy_listen_host=proxy_listen_host)
 
         # setup_network_proxy → _set_proxy → _broadcast_env_change 可能导致
         # Qt 重新读取系统代理。必须在此之后再次显式设置 NoProxy。

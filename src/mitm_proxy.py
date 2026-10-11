@@ -778,18 +778,23 @@ class MitmProxyManager:
     - "compat": Reverse proxy on port 443 for DNS-based traffic interception
     """
 
-    def __init__(self, *, addon, port=DEFAULT_PROXY_PORT, mode="regular", debug=False):
+    def __init__(self, *, addon, port=DEFAULT_PROXY_PORT, mode="regular", debug=False, listen_host="127.0.0.1"):
         """
         Args:
             addon: The mitmproxy addon to use
             port: Proxy listen port (used in regular mode)
             mode: "regular" for HTTP proxy, "compat" for reverse proxy on 443
             debug: Use mitmweb (Web UI) instead of the headless DumpMaster
+            listen_host: Interface for regular proxy mode. Compat mode always
+                listens on 127.0.0.1 because its DNS/hosts redirection is local.
         """
         self.addon = addon
         self.port = port
         self.mode = mode
         self.debug = bool(debug)
+        self.listen_host = str(listen_host or "127.0.0.1").strip()
+        if not self.listen_host:
+            self.listen_host = "127.0.0.1"
         self._thread: threading.Thread | None = None
         self._master = None
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -798,12 +803,12 @@ class MitmProxyManager:
     # Port selection
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _is_port_available(port: int) -> bool:
+    def _is_port_available(self, port: int) -> bool:
         import socket
+        host = "127.0.0.1" if self.mode == "compat" else self.listen_host
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             try:
-                s.bind(("127.0.0.1", port))
+                s.bind((host, port))
                 return True
             except OSError:
                 return False
@@ -830,7 +835,7 @@ class MitmProxyManager:
         # Fallback: let the OS pick a random available port
         import socket
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind(("127.0.0.1", 0))
+            s.bind((self.listen_host, 0))
             self.port = s.getsockname()[1]
         logger.warning(f"端口 {original} 及附近端口均被占用，改用随机端口 {self.port}")
 
@@ -863,7 +868,8 @@ class MitmProxyManager:
         self._thread.start()
 
         mode_desc = "兼容模式 (反向代理)" if self.mode == "compat" else "常规代理模式"
-        logger.info(f"mitmproxy {mode_desc}已启动，监听端口 {self.port}")
+        endpoint = "127.0.0.1" if self.mode == "compat" else self.listen_host
+        logger.info(f"mitmproxy {mode_desc} started on {endpoint}:{self.port}")
 
     def _run_proxy(self):
         """Thread target: create an asyncio event loop and run mitmproxy."""
@@ -924,7 +930,7 @@ class MitmProxyManager:
         else:
             # 常规代理模式
             opts = Options(
-                listen_host="127.0.0.1",
+                listen_host=self.listen_host,
                 listen_port=self.port,
                 confdir=confdir,
                 ssl_insecure=False,  # DO verify upstream certs

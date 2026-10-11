@@ -586,7 +586,7 @@ class LocalRequestHandler:
 
     def _set_default(self, args, body, method):
         try:
-            game_id = args["game_id"]
+            game_id = getShortGameId(args["game_id"])
             genv.set(f"auto-{game_id}", args["uuid"], True)
             return self._json_response(200, {"success": True})
         except Exception:
@@ -595,7 +595,7 @@ class LocalRequestHandler:
 
     def _clear_default(self, args, body, method):
         try:
-            game_id = args["game_id"]
+            game_id = getShortGameId(args["game_id"])
             genv.set(f"auto-{game_id}", "", True)
             return self._json_response(200, {"success": True})
         except Exception:
@@ -1613,9 +1613,10 @@ class LocalRequestHandler:
             return self._json_response(500, {"success": False, "error": str(e)})
 
     def _get_default_channel(self, args, body, method):
-        uuid = genv.get(f"auto-{args.get('game_id', '')}", "")
+        game_id = getShortGameId(args.get("game_id", ""))
+        uuid = genv.get(f"auto-{game_id}", "")
         if uuid and app_state.channels_helper.query_channel(uuid) is None:
-            genv.set(f"auto-{args.get('game_id', '')}", "", True)
+            genv.set(f"auto-{game_id}", "", True)
             uuid = ""
         return self._json_response(200, {"uuid": uuid})
 
